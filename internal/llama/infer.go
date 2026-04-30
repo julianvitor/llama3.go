@@ -3,6 +3,7 @@ package llama
 import (
 	"fmt"
 	"math"
+	"sync"
 )
 
 func (m *Model) Forward(s *State, token int32) ([]float32, error) {
@@ -13,16 +14,11 @@ func (m *Model) Forward(s *State, token int32) ([]float32, error) {
 	return logits, nil
 }
 
-// ForwardInto advances the model state by one token.
-// If logitsOut is non-nil, it must be length vocab_size and will be filled with logits.
-// If logitsOut is nil, logits computation is skipped (useful when ingesting prompts).
 func (m *Model) ForwardInto(s *State, token int32, logitsOut []float32) error {
 	ws := m.NewWorkspace(s.KV.CtxLen, 0)
 	return m.ForwardIntoWorkspace(s, token, logitsOut, ws)
 }
 
-// ForwardIntoWorkspace is a low-allocation variant of ForwardInto that reuses buffers.
-// ws must be created with ctxLen >= s.KV.CtxLen.
 func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32, ws *Workspace) error {
 	if s.Pos >= s.KV.CtxLen {
 		return fmt.Errorf("context length exceeded (%d)", s.KV.CtxLen)
@@ -37,7 +33,6 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 		return fmt.Errorf("workspace ctxLen=%d < state ctxLen=%d", ws.CtxLen, s.KV.CtxLen)
 	}
 
-	// embedding
 	x := ws.X
 	if err := m.embedInto(token, x); err != nil {
 		return err
@@ -56,20 +51,9 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 		group = 1
 	}
 
-	xn := ws.XN
-	attnOut := ws.Attn
-	projOut := ws.Proj
-	ffnIn := ws.FFNIn
-	ffnAct := ws.FFNAct
-	ffnUp := ws.FFNUp
-	ffnGate := ws.FFNGate
-	ffnDown := ws.FFNDown
-
-	q := ws.Q
-	k := ws.K
-	v := ws.V
-
-	// score scratch
+	xn, attnOut, projOut := ws.XN, ws.Attn, ws.Proj
+	ffnIn, ffnAct, ffnUp, ffnGate, ffnDown := ws.FFNIn, ws.FFNAct, ws.FFNUp, ws.FFNGate, ws.FFNDown
+	q, k, v := ws.Q, ws.K, ws.V
 	scoresScratch := ws.Scores
 
 	for layer := 0; layer < m.HP.NLayers; layer++ {
@@ -78,29 +62,23 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 		// attn norm
 		rmsNorm(xn, x, m.AttnNormW[layer], m.HP.RmsEps)
 
-		// q,k,v
-		if lw.Wq.Type() == ggmlTypeQ8_0 {
+		// q,k,v em paralelo
+		var wg sync.WaitGroup
+		var errQ, errK, errV error
+		isQ8 := lw.Wq.Type() == ggmlTypeQ8_0
+		if isQ8 {
 			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q); err != nil {
-				return err
-			}
-			if err := m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k); err != nil {
-				return err
-			}
-			if err := m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v); err != nil {
-				return err
-			}
-		} else {
-			if err := m.matVec(lw.Wq, xn, q); err != nil {
-				return err
-			}
-			if err := m.matVec(lw.Wk, xn, k); err != nil {
-				return err
-			}
-			if err := m.matVec(lw.Wv, xn, v); err != nil {
-				return err
-			}
 		}
+
+		wg.Add(3)
+		go func() { defer wg.Done(); if isQ8 { errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q) } else { errQ = m.matVec(lw.Wq, xn, q) } }()
+		go func() { defer wg.Done(); if isQ8 { errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k) } else { errK = m.matVec(lw.Wk, xn, k) } }()
+		go func() { defer wg.Done(); if isQ8 { errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v) } else { errV = m.matVec(lw.Wv, xn, v) } }()
+		wg.Wait()
+
+		if errQ != nil { return errQ }
+		if errK != nil { return errK }
+		if errV != nil { return errV }
 
 		// apply RoPE to q and k
 		for h := 0; h < nHeads; h++ {
@@ -129,10 +107,10 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 					kvh = nHeadsKV - 1
 				}
 				qh := q[h*headDim : (h+1)*headDim]
-
 				base := h * ws.CtxLen
 				scores := scoresScratch[base : base+s.Pos+1]
 				maxScore := float32(-1e30)
+
 				for t := 0; t <= s.Pos; t++ {
 					kt := s.KV.GetK(layer, t, kvh)
 					var dot float32
@@ -145,6 +123,7 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 						maxScore = sc
 					}
 				}
+
 				var sumExp float32
 				for t := 0; t <= s.Pos; t++ {
 					ev := float32(math.Exp(float64(scores[t] - maxScore)))
@@ -185,25 +164,25 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 		// ffn norm
 		rmsNorm(ffnIn, x, m.FFNNormW[layer], m.HP.RmsEps)
 
-		if lw.Wup.Type() == ggmlTypeQ8_0 {
+		// ffn up and gate em paralelo
+		var errUp, errGate error
+		isFFNQ8 := lw.Wup.Type() == ggmlTypeQ8_0
+		if isFFNQ8 {
 			QuantizeQ8_0Into(ffnIn, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp); err != nil {
-				return err
-			}
-			if err := m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate); err != nil {
-				return err
-			}
-		} else {
-			if err := m.matVec(lw.Wup, ffnIn, ffnUp); err != nil {
-				return err
-			}
-			if err := m.matVec(lw.Wgate, ffnIn, ffnGate); err != nil {
-				return err
-			}
 		}
+
+		wg.Add(2)
+		go func() { defer wg.Done(); if isFFNQ8 { errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp) } else { errUp = m.matVec(lw.Wup, ffnIn, ffnUp) } }()
+		go func() { defer wg.Done(); if isFFNQ8 { errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate) } else { errGate = m.matVec(lw.Wgate, ffnIn, ffnGate) } }()
+		wg.Wait()
+
+		if errUp != nil { return errUp }
+		if errGate != nil { return errGate }
+
 		for i := 0; i < m.HP.NFF; i++ {
 			ffnAct[i] = silu(ffnGate[i]) * ffnUp[i]
 		}
+
 		if lw.Wdown.Type() == ggmlTypeQ8_0 {
 			QuantizeQ8_0Into(ffnAct, &ws.Q8Tmp)
 			if err := m.matVecQ8_0(lw.Wdown, ws.Q8Tmp, ffnDown); err != nil {
@@ -220,7 +199,6 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 	}
 
 	if logitsOut != nil {
-		// output norm
 		rmsNorm(xn, x, m.OutNormW, m.HP.RmsEps)
 		if m.OutProj.Type() == ggmlTypeQ8_0 {
 			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
@@ -238,8 +216,6 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 	return nil
 }
 
-// ForwardTopKIntoWorkspace advances state by one token and returns topK logits.
-// It requires Q8_0 output projection for the fast path.
 func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Workspace) ([]TopKItem, error) {
 	if s.Pos >= s.KV.CtxLen {
 		return nil, fmt.Errorf("context length exceeded (%d)", s.KV.CtxLen)
@@ -272,46 +248,32 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 		group = 1
 	}
 
-	xn := ws.XN
-	attnOut := ws.Attn
-	projOut := ws.Proj
-	ffnIn := ws.FFNIn
-	ffnAct := ws.FFNAct
-	ffnUp := ws.FFNUp
-	ffnGate := ws.FFNGate
-	ffnDown := ws.FFNDown
-
-	q := ws.Q
-	k := ws.K
-	v := ws.V
+	xn, attnOut, projOut := ws.XN, ws.Attn, ws.Proj
+	ffnIn, ffnAct, ffnUp, ffnGate, ffnDown := ws.FFNIn, ws.FFNAct, ws.FFNUp, ws.FFNGate, ws.FFNDown
+	q, k, v := ws.Q, ws.K, ws.V
 	scoresScratch := ws.Scores
 
 	for layer := 0; layer < m.HP.NLayers; layer++ {
 		lw := m.Layers[layer]
 		rmsNorm(xn, x, m.AttnNormW[layer], m.HP.RmsEps)
 
-		if lw.Wq.Type() == ggmlTypeQ8_0 {
+		// q,k,v em paralelo
+		var wg sync.WaitGroup
+		var errQ, errK, errV error
+		isQ8 := lw.Wq.Type() == ggmlTypeQ8_0
+		if isQ8 {
 			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q); err != nil {
-				return nil, err
-			}
-			if err := m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k); err != nil {
-				return nil, err
-			}
-			if err := m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := m.matVec(lw.Wq, xn, q); err != nil {
-				return nil, err
-			}
-			if err := m.matVec(lw.Wk, xn, k); err != nil {
-				return nil, err
-			}
-			if err := m.matVec(lw.Wv, xn, v); err != nil {
-				return nil, err
-			}
 		}
+
+		wg.Add(3)
+		go func() { defer wg.Done(); if isQ8 { errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q) } else { errQ = m.matVec(lw.Wq, xn, q) } }()
+		go func() { defer wg.Done(); if isQ8 { errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k) } else { errK = m.matVec(lw.Wk, xn, k) } }()
+		go func() { defer wg.Done(); if isQ8 { errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v) } else { errV = m.matVec(lw.Wv, xn, v) } }()
+		wg.Wait()
+
+		if errQ != nil { return nil, errQ }
+		if errK != nil { return nil, errK }
+		if errV != nil { return nil, errV }
 
 		for h := 0; h < nHeads; h++ {
 			qh := q[h*headDim : (h+1)*headDim]
@@ -390,22 +352,22 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 		}
 
 		rmsNorm(ffnIn, x, m.FFNNormW[layer], m.HP.RmsEps)
-		if lw.Wup.Type() == ggmlTypeQ8_0 {
+
+		// ffn up and gate em paralelo
+		var errUp, errGate error
+		isFFNQ8 := lw.Wup.Type() == ggmlTypeQ8_0
+		if isFFNQ8 {
 			QuantizeQ8_0Into(ffnIn, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp); err != nil {
-				return nil, err
-			}
-			if err := m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := m.matVec(lw.Wup, ffnIn, ffnUp); err != nil {
-				return nil, err
-			}
-			if err := m.matVec(lw.Wgate, ffnIn, ffnGate); err != nil {
-				return nil, err
-			}
 		}
+
+		wg.Add(2)
+		go func() { defer wg.Done(); if isFFNQ8 { errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp) } else { errUp = m.matVec(lw.Wup, ffnIn, ffnUp) } }()
+		go func() { defer wg.Done(); if isFFNQ8 { errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate) } else { errGate = m.matVec(lw.Wgate, ffnIn, ffnGate) } }()
+		wg.Wait()
+
+		if errUp != nil { return nil, errUp }
+		if errGate != nil { return nil, errGate }
+
 		for i := 0; i < m.HP.NFF; i++ {
 			ffnAct[i] = silu(ffnGate[i]) * ffnUp[i]
 		}
@@ -442,6 +404,5 @@ func (m *Model) embedInto(token int32, dst []float32) error {
 	if token < 0 || int(token) >= m.HP.VocabSize {
 		return fmt.Errorf("token out of range: %d", token)
 	}
-	// token_embd.weight is [n_embd, vocab] where rows=vocab.
 	return readRowVecAnyToF32Into(dst, m.TokenEmb, int(token))
 }
