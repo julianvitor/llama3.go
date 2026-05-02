@@ -15,7 +15,7 @@ type workItem struct {
 	start int
 	end   int
 	fn    func(start, end int)
-	wg    *sync.WaitGroup
+	done  chan struct{}
 }
 
 func NewWorkerPool(workers int) *WorkerPool {
@@ -27,7 +27,7 @@ func NewWorkerPool(workers int) *WorkerPool {
 		go func() {
 			for it := range p.ch {
 				it.fn(it.start, it.end)
-				it.wg.Done()
+				close(it.done)
 			}
 		}()
 	}
@@ -44,6 +44,47 @@ func (p *WorkerPool) Close() {
 	})
 }
 
+// Run executa múltiplas tarefas independentes em paralelo.
+// Cada tarefa é executada em um worker diferente quando possível.
+func (p *WorkerPool) Run(tasks ...func()) {
+	if len(tasks) == 0 {
+		return
+	}
+	if len(tasks) == 1 {
+		tasks[0]()
+		return
+	}
+
+	// Para poucas tarefas, usar canais diretos
+	if len(tasks) < p.workers {
+		dones := make([]chan struct{}, len(tasks))
+		for i := range dones {
+			dones[i] = make(chan struct{})
+		}
+		for i, task := range tasks {
+			done := dones[i]
+			task := task
+			p.ch <- workItem{
+				start: 0,
+				end:   1,
+				fn:    func(start, end int) { task() },
+				done:  done,
+			}
+		}
+		for _, done := range dones {
+			<-done
+		}
+		return
+	}
+
+	// Para muitas tarefas, usar ParallelFor
+	p.ParallelFor(len(tasks), func(start, end int) {
+		for i := start; i < end; i++ {
+			tasks[i]()
+		}
+	})
+}
+
 func (p *WorkerPool) ParallelFor(n int, fn func(start, end int)) {
 	if n <= 0 {
 		return
@@ -55,7 +96,7 @@ func (p *WorkerPool) ParallelFor(n int, fn func(start, end int)) {
 	}
 
 	chunk := (n + w - 1) / w
-	var wg sync.WaitGroup
+	dones := make([]chan struct{}, 0, w)
 	for i := 0; i < w; i++ {
 		start := i * chunk
 		end := start + chunk
@@ -65,8 +106,11 @@ func (p *WorkerPool) ParallelFor(n int, fn func(start, end int)) {
 		if end > n {
 			end = n
 		}
-		wg.Add(1)
-		p.ch <- workItem{start: start, end: end, fn: fn, wg: &wg}
+		done := make(chan struct{})
+		dones = append(dones, done)
+		p.ch <- workItem{start: start, end: end, fn: fn, done: done}
 	}
-	wg.Wait()
+	for _, done := range dones {
+		<-done
+	}
 }

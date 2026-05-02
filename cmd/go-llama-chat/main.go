@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -34,8 +35,26 @@ func main() {
 		topk         = flag.Int("topk", 40, "Top-K")
 		maxTokens    = flag.Int("max-tokens", 256, "Máx tokens por resposta")
 		systemPrompt = flag.String("system", llama.DefaultSystemPrompt(), "System prompt")
+		cpuProfile   = flag.String("cpuprofile", "", "Arquivo para CPU profile (pprof)")
+		memProfile   = flag.String("memprofile", "", "Arquivo para memory profile (pprof)")
 	)
 	flag.Parse()
+
+	// Iniciar CPU profiling se solicitado
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Erro criando CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "Erro iniciando CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
+		fmt.Fprintf(os.Stderr, "CPU profiling para: %s\n", *cpuProfile)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -157,6 +176,22 @@ func main() {
 			tokPerSec = float64(tokensGenerated) / elapsed.Seconds()
 		}
 		fmt.Printf("\n[%d tokens, %.2f tokens/s]\n", tokensGenerated, tokPerSec)
+	}
+
+	// Memory profiling se solicitado
+	if *memProfile != "" {
+		f, err := os.Create(*memProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Erro criando memory profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "Erro escrevendo memory profile: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Memory profile escrito para: %s\n", *memProfile)
 	}
 }
 

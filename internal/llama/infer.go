@@ -3,7 +3,6 @@ package llama
 import (
 	"fmt"
 	"math"
-	"sync"
 )
 
 func (m *Model) Forward(s *State, token int32) ([]float32, error) {
@@ -62,23 +61,47 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 		// attn norm
 		rmsNorm(xn, x, m.AttnNormW[layer], m.HP.RmsEps)
 
-		// q,k,v em paralelo
-		var wg sync.WaitGroup
+		// q,k,v em paralelo usando Pool.Run()
 		var errQ, errK, errV error
 		isQ8 := lw.Wq.Type() == ggmlTypeQ8_0
 		if isQ8 {
 			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
 		}
 
-		wg.Add(3)
-		go func() { defer wg.Done(); if isQ8 { errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q) } else { errQ = m.matVec(lw.Wq, xn, q) } }()
-		go func() { defer wg.Done(); if isQ8 { errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k) } else { errK = m.matVec(lw.Wk, xn, k) } }()
-		go func() { defer wg.Done(); if isQ8 { errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v) } else { errV = m.matVec(lw.Wv, xn, v) } }()
-		wg.Wait()
+		// Usar Pool.Run() para reduzir contention vs manual goroutines
+		m.Pool.Run(
+			func() {
+				if isQ8 {
+					errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q)
+				} else {
+					errQ = m.matVec(lw.Wq, xn, q)
+				}
+			},
+			func() {
+				if isQ8 {
+					errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k)
+				} else {
+					errK = m.matVec(lw.Wk, xn, k)
+				}
+			},
+			func() {
+				if isQ8 {
+					errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v)
+				} else {
+					errV = m.matVec(lw.Wv, xn, v)
+				}
+			},
+		)
 
-		if errQ != nil { return errQ }
-		if errK != nil { return errK }
-		if errV != nil { return errV }
+		if errQ != nil {
+			return errQ
+		}
+		if errK != nil {
+			return errK
+		}
+		if errV != nil {
+			return errV
+		}
 
 		// apply RoPE to q and k
 		for h := 0; h < nHeads; h++ {
@@ -171,13 +194,30 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 			QuantizeQ8_0Into(ffnIn, &ws.Q8Tmp)
 		}
 
-		wg.Add(2)
-		go func() { defer wg.Done(); if isFFNQ8 { errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp) } else { errUp = m.matVec(lw.Wup, ffnIn, ffnUp) } }()
-		go func() { defer wg.Done(); if isFFNQ8 { errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate) } else { errGate = m.matVec(lw.Wgate, ffnIn, ffnGate) } }()
-		wg.Wait()
+		// Usar Pool.Run() para paralelizar FFN up e gate
+		m.Pool.Run(
+			func() {
+				if isFFNQ8 {
+					errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp)
+				} else {
+					errUp = m.matVec(lw.Wup, ffnIn, ffnUp)
+				}
+			},
+			func() {
+				if isFFNQ8 {
+					errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate)
+				} else {
+					errGate = m.matVec(lw.Wgate, ffnIn, ffnGate)
+				}
+			},
+		)
 
-		if errUp != nil { return errUp }
-		if errGate != nil { return errGate }
+		if errUp != nil {
+			return errUp
+		}
+		if errGate != nil {
+			return errGate
+		}
 
 		for i := 0; i < m.HP.NFF; i++ {
 			ffnAct[i] = silu(ffnGate[i]) * ffnUp[i]
@@ -257,23 +297,47 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 		lw := m.Layers[layer]
 		rmsNorm(xn, x, m.AttnNormW[layer], m.HP.RmsEps)
 
-		// q,k,v em paralelo
-		var wg sync.WaitGroup
+		// q,k,v em paralelo usando Pool.Run()
 		var errQ, errK, errV error
 		isQ8 := lw.Wq.Type() == ggmlTypeQ8_0
 		if isQ8 {
 			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
 		}
 
-		wg.Add(3)
-		go func() { defer wg.Done(); if isQ8 { errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q) } else { errQ = m.matVec(lw.Wq, xn, q) } }()
-		go func() { defer wg.Done(); if isQ8 { errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k) } else { errK = m.matVec(lw.Wk, xn, k) } }()
-		go func() { defer wg.Done(); if isQ8 { errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v) } else { errV = m.matVec(lw.Wv, xn, v) } }()
-		wg.Wait()
+		// Usar Pool.Run() para reduzir contention vs manual goroutines
+		m.Pool.Run(
+			func() {
+				if isQ8 {
+					errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q)
+				} else {
+					errQ = m.matVec(lw.Wq, xn, q)
+				}
+			},
+			func() {
+				if isQ8 {
+					errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k)
+				} else {
+					errK = m.matVec(lw.Wk, xn, k)
+				}
+			},
+			func() {
+				if isQ8 {
+					errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v)
+				} else {
+					errV = m.matVec(lw.Wv, xn, v)
+				}
+			},
+		)
 
-		if errQ != nil { return nil, errQ }
-		if errK != nil { return nil, errK }
-		if errV != nil { return nil, errV }
+		if errQ != nil {
+			return nil, errQ
+		}
+		if errK != nil {
+			return nil, errK
+		}
+		if errV != nil {
+			return nil, errV
+		}
 
 		for h := 0; h < nHeads; h++ {
 			qh := q[h*headDim : (h+1)*headDim]
@@ -360,13 +424,30 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 			QuantizeQ8_0Into(ffnIn, &ws.Q8Tmp)
 		}
 
-		wg.Add(2)
-		go func() { defer wg.Done(); if isFFNQ8 { errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp) } else { errUp = m.matVec(lw.Wup, ffnIn, ffnUp) } }()
-		go func() { defer wg.Done(); if isFFNQ8 { errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate) } else { errGate = m.matVec(lw.Wgate, ffnIn, ffnGate) } }()
-		wg.Wait()
+		// Usar Pool.Run() para paralelizar FFN up e gate
+		m.Pool.Run(
+			func() {
+				if isFFNQ8 {
+					errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp)
+				} else {
+					errUp = m.matVec(lw.Wup, ffnIn, ffnUp)
+				}
+			},
+			func() {
+				if isFFNQ8 {
+					errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate)
+				} else {
+					errGate = m.matVec(lw.Wgate, ffnIn, ffnGate)
+				}
+			},
+		)
 
-		if errUp != nil { return nil, errUp }
-		if errGate != nil { return nil, errGate }
+		if errUp != nil {
+			return nil, errUp
+		}
+		if errGate != nil {
+			return nil, errGate
+		}
 
 		for i := 0; i < m.HP.NFF; i++ {
 			ffnAct[i] = silu(ffnGate[i]) * ffnUp[i]
