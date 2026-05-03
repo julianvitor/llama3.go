@@ -6,7 +6,7 @@ import (
 )
 
 func DefaultSystemPrompt() string {
-	return "Você é um assistente útil e objetivo."
+	return "You are a helpful assistant. Respond in the same language the user uses."
 }
 
 func TodayString() string {

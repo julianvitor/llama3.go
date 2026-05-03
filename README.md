@@ -1,14 +1,14 @@
-# go_llama (runtime 100%(quase) Go)
+# go_llama (runtime em Go + Cgo com fallback 100% em go)
 
-Chat no terminal que **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem servidor externo).
+Chat no terminal **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem servidor externo).
 
 ## Rodar
 Com otimizações para x86(AVX2) ou ARMv8 (neon)
 ```bash
-CGO_ENABLED=0 go run ./cmd/go-llama-chat
+CGO_ENABLED=1 go run ./cmd/go-llama-chat
 ```
 
-Para rodar em go puro.
+Para rodar em go puro(cpus sem SIMD compativel).
 ```bash
 CGO_ENABLED=0 go run ./cmd/go-llama-chat
 ```
@@ -50,6 +50,13 @@ Se o download do Hugging Face exigir autenticação, defina:
 ```bash
 export HF_TOKEN=...  # token do Hugging Face
 ```
+Modelos testados
+| Modelo | Parâmetros | Quantização | Link de Download |
+| :--- | :---: | :---: | :--- |
+| **Llama 3.2 Instruct** | 1B | Q8_0 | [hf.co/Llama-3.2-1B](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf) |
+| **Llama 3.2 Instruct** | 3B | Q8_0 | [hf.co/Llama-3.2-3B](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf) |
+| **Llama 3.1 Instruct** | 8B | Q8_0 | [hf.co/Meta-Llama-3.1-8B](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf) |
+---
 
 ### Profiling e Análise de Desempenho
 
