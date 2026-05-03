@@ -1,7 +1,8 @@
 # go_llama (runtime em Go + Cgo com fallback 100% em go)
 
 Chat no terminal **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem servidor externo).
-<img src="docs/llama_go.jpg" width="500"/>
+
+<img src="docs/llama_go.jpg" width="600"/>
 ## Rodar
 Com otimizações para x86(AVX2) ou ARMv8 (neon)
 ```bash
