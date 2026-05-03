@@ -57,12 +57,13 @@ func main() {
 	defer cancel()
 
 	if *modelPath == "" {
-		cacheDir, err := os.UserCacheDir()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "erro cache dir:", err)
-			os.Exit(1)
-		}
-		*modelPath = filepath.Join(cacheDir, "go-llama", "Llama-3.2-1B-Instruct-Q8_0.gguf")
+		cacheDir, _ := os.UserCacheDir()
+		
+		// Pega a última parte da URL (ex: Llama-3.2-3B.gguf)
+		parts := strings.Split(*modelURL, "/")
+		fileName := parts[len(parts)-1]
+		
+		*modelPath = filepath.Join(cacheDir, "go-llama", fileName)
 	}
 
 	if err := ensureModel(ctx, *modelURL, *modelPath); err != nil {
@@ -197,7 +198,7 @@ func ensureModel(ctx context.Context, url, dest string) error {
 		return nil
 	}
 
-	fmt.Println("Baixando modelo... (1.3GB)")
+	fmt.Println("Baixando modelo...")
 	progressCh := make(chan downloader.Progress, 16)
 	errCh := make(chan error, 1)
 

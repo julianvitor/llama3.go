@@ -50,6 +50,13 @@ Se o download do Hugging Face exigir autenticação, defina:
 ```bash
 export HF_TOKEN=...  # token do Hugging Face
 ```
+Modelos testados
+| Modelo | Parâmetros | Quantização | Link de Download |
+| :--- | :---: | :---: | :--- |
+| **Llama 3.2 Instruct** | 1B | Q8_0 | [hf.co/Llama-3.2-1B](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf) |
+| **Llama 3.2 Instruct** | 3B | Q8_0 | [hf.co/Llama-3.2-3B](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf) |
+| **Llama 3.1 Instruct** | 8B | Q8_0 | [hf.co/Meta-Llama-3.1-8B](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf) |
+---
 
 ### Profiling e Análise de Desempenho
 
