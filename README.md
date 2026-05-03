@@ -1,6 +1,6 @@
 # go_llama (runtime 100%(quase) Go)
 
-Chat no terminal que **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem CGO, sem servidor externo).
+Chat no terminal que **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem servidor externo).
 
 ## Rodar
 
