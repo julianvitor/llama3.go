@@ -32,8 +32,9 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 		return fmt.Errorf("workspace ctxLen=%d < state ctxLen=%d", ws.CtxLen, s.KV.CtxLen)
 	}
 
-	x := ws.X
-	if err := m.embedInto(token, x); err != nil {
+	// 1. Embedding: converte o token ID em um vetor denso inicial (hidden state)
+	hiddenState := ws.X
+	if err := m.embedInto(token, hiddenState); err != nil {
 		return err
 	}
 
@@ -45,50 +46,54 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 	if ropeDim > headDim {
 		ropeDim = headDim
 	}
+	// Multi-Query Attention (MQA) ou Grouped-Query Attention (GQA):
+	// define quantos heads de query compartilham o mesmo head de key/value
 	group := nHeads / nHeadsKV
 	if group <= 0 {
 		group = 1
 	}
 
-	xn, attnOut, projOut := ws.XN, ws.Attn, ws.Proj
+	// Buffers temporários do workspace
+	normedState, attentionOut, attentionProj := ws.XN, ws.Attn, ws.Proj
 	ffnIn, ffnAct, ffnUp, ffnGate, ffnDown := ws.FFNIn, ws.FFNAct, ws.FFNUp, ws.FFNGate, ws.FFNDown
-	q, k, v := ws.Q, ws.K, ws.V
-	scoresScratch := ws.Scores
+	query, key, value := ws.Q, ws.K, ws.V
+	attentionScores := ws.Scores
 
+	// Loop principal sobre as camadas do Transformer
 	for layer := 0; layer < m.HP.NLayers; layer++ {
-		lw := m.Layers[layer]
+		layerWeights := m.Layers[layer]
 
-		// attn norm
-		rmsNorm(xn, x, m.AttnNormW[layer], m.HP.RmsEps)
+		// 2. Pré-Normalização (RMSNorm) antes da camada de Atenção
+		rmsNorm(normedState, hiddenState, m.AttnNormW[layer], m.HP.RmsEps)
 
-		// q,k,v em paralelo usando Pool.Run()
+		// 3. Projeções Lineares Q, K, V (em paralelo)
 		var errQ, errK, errV error
-		isQ8 := lw.Wq.Type() == ggmlTypeQ8_0
+		isQ8 := layerWeights.Wq.Type() == ggmlTypeQ8_0
 		if isQ8 {
-			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
+			QuantizeQ8_0Into(normedState, &ws.Q8Tmp)
 		}
 
 		// Usar Pool.Run() para reduzir contention vs manual goroutines
 		m.Pool.Run(
 			func() {
 				if isQ8 {
-					errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q)
+					errQ = m.matVecQ8_0(layerWeights.Wq, ws.Q8Tmp, query)
 				} else {
-					errQ = m.matVec(lw.Wq, xn, q)
+					errQ = m.matVec(layerWeights.Wq, normedState, query)
 				}
 			},
 			func() {
 				if isQ8 {
-					errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k)
+					errK = m.matVecQ8_0(layerWeights.Wk, ws.Q8Tmp, key)
 				} else {
-					errK = m.matVec(lw.Wk, xn, k)
+					errK = m.matVec(layerWeights.Wk, normedState, key)
 				}
 			},
 			func() {
 				if isQ8 {
-					errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v)
+					errV = m.matVecQ8_0(layerWeights.Wv, ws.Q8Tmp, value)
 				} else {
-					errV = m.matVec(lw.Wv, xn, v)
+					errV = m.matVec(layerWeights.Wv, normedState, value)
 				}
 			},
 		)
@@ -103,108 +108,111 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 			return errV
 		}
 
-		// apply RoPE to q and k
+		// 4. Rotary Positional Embeddings (RoPE): adiciona informação posicional
 		for h := 0; h < nHeads; h++ {
-			qh := q[h*headDim : (h+1)*headDim]
-			s.Rope.ApplyInPlace(qh[:ropeDim], s.Pos)
+			queryHead := query[h*headDim : (h+1)*headDim]
+			s.Rope.ApplyInPlace(queryHead[:ropeDim], s.Pos)
 		}
 		for kh := 0; kh < nHeadsKV; kh++ {
-			kk := k[kh*headDim : (kh+1)*headDim]
-			s.Rope.ApplyInPlace(kk[:ropeDim], s.Pos)
+			keyHead := key[kh*headDim : (kh+1)*headDim]
+			s.Rope.ApplyInPlace(keyHead[:ropeDim], s.Pos)
 		}
 
-		// write to KV cache
+		// 5. Salva Key e Value no cache (KV Cache) para uso futuro em auto-regressão
 		for kh := 0; kh < nHeadsKV; kh++ {
-			kk := k[kh*headDim : (kh+1)*headDim]
-			vv := v[kh*headDim : (kh+1)*headDim]
-			s.KV.SetK(layer, s.Pos, kh, kk)
-			s.KV.SetV(layer, s.Pos, kh, vv)
+			keyHead := key[kh*headDim : (kh+1)*headDim]
+			valueHead := value[kh*headDim : (kh+1)*headDim]
+			s.KV.SetK(layer, s.Pos, kh, keyHead)
+			s.KV.SetV(layer, s.Pos, kh, valueHead)
 		}
 
-		// attention (parallel over heads)
+		// 6. Calcula a Atenção (Multi-Head Attention) paralelizada pelos heads
 		scale := float32(1.0 / math.Sqrt(float64(headDim)))
 		m.Pool.ParallelFor(nHeads, func(hStart, hEnd int) {
 			for h := hStart; h < hEnd; h++ {
-				kvh := h / group
-				if kvh >= nHeadsKV {
-					kvh = nHeadsKV - 1
+				kvHeadIdx := h / group
+				if kvHeadIdx >= nHeadsKV {
+					kvHeadIdx = nHeadsKV - 1
 				}
-				qh := q[h*headDim : (h+1)*headDim]
+				queryHead := query[h*headDim : (h+1)*headDim]
 				base := h * ws.CtxLen
-				scores := scoresScratch[base : base+s.Pos+1]
+				scores := attentionScores[base : base+s.Pos+1]
 				maxScore := float32(-1e30)
 
+				// Calcula os scores de atenção (Query . Key)
 				for t := 0; t <= s.Pos; t++ {
-					kt := s.KV.GetK(layer, t, kvh)
-					dot := m.Dot(qh, kt)
-					sc := dot * scale
-					scores[t] = sc
-					if sc > maxScore {
-						maxScore = sc
+					keyAtT := s.KV.GetK(layer, t, kvHeadIdx)
+					dot := m.Dot(queryHead, keyAtT)
+					score := dot * scale
+					scores[t] = score
+					if score > maxScore {
+						maxScore = score
 					}
 				}
 
+				// Softmax sobre os scores para obter os pesos de atenção
 				var sumExp float32
 				for t := 0; t <= s.Pos; t++ {
-					ev := float32(math.Exp(float64(scores[t] - maxScore)))
-					scores[t] = ev
-					sumExp += ev
+					expVal := float32(math.Exp(float64(scores[t] - maxScore)))
+					scores[t] = expVal
+					sumExp += expVal
 				}
-				inv := float32(1.0) / sumExp
+				invSumExp := float32(1.0) / sumExp
 
-				outHead := attnOut[h*headDim : (h+1)*headDim]
+				// Combina os Values usando os pesos calculados (Attention = Softmax(Q.K) . V)
+				outHead := attentionOut[h*headDim : (h+1)*headDim]
 				for i := 0; i < headDim; i++ {
 					outHead[i] = 0
 				}
 				for t := 0; t <= s.Pos; t++ {
-					w := scores[t] * inv
-					vt := s.KV.GetV(layer, t, kvh)
+					attentionWeight := scores[t] * invSumExp
+					valueAtT := s.KV.GetV(layer, t, kvHeadIdx)
 					for i := 0; i < headDim; i++ {
-						outHead[i] += w * vt[i]
+						outHead[i] += attentionWeight * valueAtT[i]
 					}
 				}
 			}
 		})
 
-		// project attention output and residual
-		if lw.Wo.Type() == ggmlTypeQ8_0 {
-			QuantizeQ8_0Into(attnOut, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wo, ws.Q8Tmp, projOut); err != nil {
+		// 7. Projeção de saída da atenção (Wo) e conexão residual (Add)
+		if layerWeights.Wo.Type() == ggmlTypeQ8_0 {
+			QuantizeQ8_0Into(attentionOut, &ws.Q8Tmp)
+			if err := m.matVecQ8_0(layerWeights.Wo, ws.Q8Tmp, attentionProj); err != nil {
 				return err
 			}
 		} else {
-			if err := m.matVec(lw.Wo, attnOut, projOut); err != nil {
+			if err := m.matVec(layerWeights.Wo, attentionOut, attentionProj); err != nil {
 				return err
 			}
 		}
+		// Conexão residual
 		for i := 0; i < nEmb; i++ {
-			x[i] += projOut[i]
+			hiddenState[i] += attentionProj[i]
 		}
 
-		// ffn norm
-		rmsNorm(ffnIn, x, m.FFNNormW[layer], m.HP.RmsEps)
+		// 8. Pré-Normalização para Feed-Forward Network (FFN)
+		rmsNorm(ffnIn, hiddenState, m.FFNNormW[layer], m.HP.RmsEps)
 
-		// ffn up and gate em paralelo
+		// 9. Feed-Forward Network (FFN) - Up e Gate projecions em paralelo
 		var errUp, errGate error
-		isFFNQ8 := lw.Wup.Type() == ggmlTypeQ8_0
+		isFFNQ8 := layerWeights.Wup.Type() == ggmlTypeQ8_0
 		if isFFNQ8 {
 			QuantizeQ8_0Into(ffnIn, &ws.Q8Tmp)
 		}
 
-		// Usar Pool.Run() para paralelizar FFN up e gate
 		m.Pool.Run(
 			func() {
 				if isFFNQ8 {
-					errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp)
+					errUp = m.matVecQ8_0(layerWeights.Wup, ws.Q8Tmp, ffnUp)
 				} else {
-					errUp = m.matVec(lw.Wup, ffnIn, ffnUp)
+					errUp = m.matVec(layerWeights.Wup, ffnIn, ffnUp)
 				}
 			},
 			func() {
 				if isFFNQ8 {
-					errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate)
+					errGate = m.matVecQ8_0(layerWeights.Wgate, ws.Q8Tmp, ffnGate)
 				} else {
-					errGate = m.matVec(lw.Wgate, ffnIn, ffnGate)
+					errGate = m.matVec(layerWeights.Wgate, ffnIn, ffnGate)
 				}
 			},
 		)
@@ -216,39 +224,44 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 			return errGate
 		}
 
+		// 10. Função de Ativação (SwiGLU)
 		for i := 0; i < m.HP.NFF; i++ {
 			ffnAct[i] = silu(ffnGate[i]) * ffnUp[i]
 		}
 
-		if lw.Wdown.Type() == ggmlTypeQ8_0 {
+		// 11. Projeção FFN Down e conexão residual
+		if layerWeights.Wdown.Type() == ggmlTypeQ8_0 {
 			QuantizeQ8_0Into(ffnAct, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wdown, ws.Q8Tmp, ffnDown); err != nil {
+			if err := m.matVecQ8_0(layerWeights.Wdown, ws.Q8Tmp, ffnDown); err != nil {
 				return err
 			}
 		} else {
-			if err := m.matVec(lw.Wdown, ffnAct, ffnDown); err != nil {
+			if err := m.matVec(layerWeights.Wdown, ffnAct, ffnDown); err != nil {
 				return err
 			}
 		}
+		// Conexão residual
 		for i := 0; i < nEmb; i++ {
-			x[i] += ffnDown[i]
+			hiddenState[i] += ffnDown[i]
 		}
 	}
 
+	// 12. Pós-Normalização e projeção final para obter Logits (apenas se solicitado)
 	if logitsOut != nil {
-		rmsNorm(xn, x, m.OutNormW, m.HP.RmsEps)
+		rmsNorm(normedState, hiddenState, m.OutNormW, m.HP.RmsEps)
 		if m.OutProj.Type() == ggmlTypeQ8_0 {
-			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
+			QuantizeQ8_0Into(normedState, &ws.Q8Tmp)
 			if err := m.matVecQ8_0(m.OutProj, ws.Q8Tmp, logitsOut); err != nil {
 				return err
 			}
 		} else {
-			if err := m.matVec(m.OutProj, xn, logitsOut); err != nil {
+			if err := m.matVec(m.OutProj, normedState, logitsOut); err != nil {
 				return err
 			}
 		}
 	}
 
+	// Avança a posição no estado
 	s.Pos++
 	return nil
 }
@@ -267,8 +280,9 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 		topK = 40
 	}
 
-	x := ws.X
-	if err := m.embedInto(token, x); err != nil {
+	// 1. Embedding: converte o token ID em um vetor denso inicial (hidden state)
+	hiddenState := ws.X
+	if err := m.embedInto(token, hiddenState); err != nil {
 		return nil, err
 	}
 
@@ -280,48 +294,52 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 	if ropeDim > headDim {
 		ropeDim = headDim
 	}
+	// Multi-Query Attention (MQA) ou Grouped-Query Attention (GQA)
 	group := nHeads / nHeadsKV
 	if group <= 0 {
 		group = 1
 	}
 
-	xn, attnOut, projOut := ws.XN, ws.Attn, ws.Proj
+	// Buffers temporários do workspace
+	normedState, attentionOut, attentionProj := ws.XN, ws.Attn, ws.Proj
 	ffnIn, ffnAct, ffnUp, ffnGate, ffnDown := ws.FFNIn, ws.FFNAct, ws.FFNUp, ws.FFNGate, ws.FFNDown
-	q, k, v := ws.Q, ws.K, ws.V
-	scoresScratch := ws.Scores
+	query, key, value := ws.Q, ws.K, ws.V
+	attentionScores := ws.Scores
 
+	// Loop principal sobre as camadas do Transformer
 	for layer := 0; layer < m.HP.NLayers; layer++ {
-		lw := m.Layers[layer]
-		rmsNorm(xn, x, m.AttnNormW[layer], m.HP.RmsEps)
+		layerWeights := m.Layers[layer]
 
-		// q,k,v em paralelo usando Pool.Run()
+		// 2. Pré-Normalização (RMSNorm) antes da camada de Atenção
+		rmsNorm(normedState, hiddenState, m.AttnNormW[layer], m.HP.RmsEps)
+
+		// 3. Projeções Lineares Q, K, V (em paralelo)
 		var errQ, errK, errV error
-		isQ8 := lw.Wq.Type() == ggmlTypeQ8_0
+		isQ8 := layerWeights.Wq.Type() == ggmlTypeQ8_0
 		if isQ8 {
-			QuantizeQ8_0Into(xn, &ws.Q8Tmp)
+			QuantizeQ8_0Into(normedState, &ws.Q8Tmp)
 		}
 
-		// Usar Pool.Run() para reduzir contention vs manual goroutines
 		m.Pool.Run(
 			func() {
 				if isQ8 {
-					errQ = m.matVecQ8_0(lw.Wq, ws.Q8Tmp, q)
+					errQ = m.matVecQ8_0(layerWeights.Wq, ws.Q8Tmp, query)
 				} else {
-					errQ = m.matVec(lw.Wq, xn, q)
+					errQ = m.matVec(layerWeights.Wq, normedState, query)
 				}
 			},
 			func() {
 				if isQ8 {
-					errK = m.matVecQ8_0(lw.Wk, ws.Q8Tmp, k)
+					errK = m.matVecQ8_0(layerWeights.Wk, ws.Q8Tmp, key)
 				} else {
-					errK = m.matVec(lw.Wk, xn, k)
+					errK = m.matVec(layerWeights.Wk, normedState, key)
 				}
 			},
 			func() {
 				if isQ8 {
-					errV = m.matVecQ8_0(lw.Wv, ws.Q8Tmp, v)
+					errV = m.matVecQ8_0(layerWeights.Wv, ws.Q8Tmp, value)
 				} else {
-					errV = m.matVec(lw.Wv, xn, v)
+					errV = m.matVec(layerWeights.Wv, normedState, value)
 				}
 			},
 		)
@@ -336,102 +354,112 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 			return nil, errV
 		}
 
+		// 4. Rotary Positional Embeddings (RoPE)
 		for h := 0; h < nHeads; h++ {
-			qh := q[h*headDim : (h+1)*headDim]
-			s.Rope.ApplyInPlace(qh[:ropeDim], s.Pos)
+			queryHead := query[h*headDim : (h+1)*headDim]
+			s.Rope.ApplyInPlace(queryHead[:ropeDim], s.Pos)
 		}
 		for kh := 0; kh < nHeadsKV; kh++ {
-			kk := k[kh*headDim : (kh+1)*headDim]
-			s.Rope.ApplyInPlace(kk[:ropeDim], s.Pos)
+			keyHead := key[kh*headDim : (kh+1)*headDim]
+			s.Rope.ApplyInPlace(keyHead[:ropeDim], s.Pos)
 		}
 
+		// 5. Salva Key e Value no cache (KV Cache)
 		for kh := 0; kh < nHeadsKV; kh++ {
-			kk := k[kh*headDim : (kh+1)*headDim]
-			vv := v[kh*headDim : (kh+1)*headDim]
-			s.KV.SetK(layer, s.Pos, kh, kk)
-			s.KV.SetV(layer, s.Pos, kh, vv)
+			keyHead := key[kh*headDim : (kh+1)*headDim]
+			valueHead := value[kh*headDim : (kh+1)*headDim]
+			s.KV.SetK(layer, s.Pos, kh, keyHead)
+			s.KV.SetV(layer, s.Pos, kh, valueHead)
 		}
 
+		// 6. Calcula a Atenção (Multi-Head Attention) paralelizada pelos heads
 		scale := float32(1.0 / math.Sqrt(float64(headDim)))
 		m.Pool.ParallelFor(nHeads, func(hStart, hEnd int) {
 			for h := hStart; h < hEnd; h++ {
-				kvh := h / group
-				if kvh >= nHeadsKV {
-					kvh = nHeadsKV - 1
+				kvHeadIdx := h / group
+				if kvHeadIdx >= nHeadsKV {
+					kvHeadIdx = nHeadsKV - 1
 				}
-				qh := q[h*headDim : (h+1)*headDim]
+				queryHead := query[h*headDim : (h+1)*headDim]
 
 				base := h * ws.CtxLen
-				scores := scoresScratch[base : base+s.Pos+1]
+				scores := attentionScores[base : base+s.Pos+1]
 				maxScore := float32(-1e30)
+
+				// Calcula os scores de atenção (Query . Key)
 				for t := 0; t <= s.Pos; t++ {
-					kt := s.KV.GetK(layer, t, kvh)
-					dot := m.Dot(qh, kt)
-					sc := dot * scale
-					scores[t] = sc
-					if sc > maxScore {
-						maxScore = sc
+					keyAtT := s.KV.GetK(layer, t, kvHeadIdx)
+					dot := m.Dot(queryHead, keyAtT)
+					score := dot * scale
+					scores[t] = score
+					if score > maxScore {
+						maxScore = score
 					}
 				}
+
+				// Softmax sobre os scores
 				var sumExp float32
 				for t := 0; t <= s.Pos; t++ {
-					ev := float32(math.Exp(float64(scores[t] - maxScore)))
-					scores[t] = ev
-					sumExp += ev
+					expVal := float32(math.Exp(float64(scores[t] - maxScore)))
+					scores[t] = expVal
+					sumExp += expVal
 				}
-				inv := float32(1.0) / sumExp
+				invSumExp := float32(1.0) / sumExp
 
-				outHead := attnOut[h*headDim : (h+1)*headDim]
+				// Combina os Values
+				outHead := attentionOut[h*headDim : (h+1)*headDim]
 				for i := 0; i < headDim; i++ {
 					outHead[i] = 0
 				}
 				for t := 0; t <= s.Pos; t++ {
-					w := scores[t] * inv
-					vt := s.KV.GetV(layer, t, kvh)
+					attentionWeight := scores[t] * invSumExp
+					valueAtT := s.KV.GetV(layer, t, kvHeadIdx)
 					for i := 0; i < headDim; i++ {
-						outHead[i] += w * vt[i]
+						outHead[i] += attentionWeight * valueAtT[i]
 					}
 				}
 			}
 		})
 
-		if lw.Wo.Type() == ggmlTypeQ8_0 {
-			QuantizeQ8_0Into(attnOut, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wo, ws.Q8Tmp, projOut); err != nil {
+		// 7. Projeção de saída da atenção (Wo) e conexão residual (Add)
+		if layerWeights.Wo.Type() == ggmlTypeQ8_0 {
+			QuantizeQ8_0Into(attentionOut, &ws.Q8Tmp)
+			if err := m.matVecQ8_0(layerWeights.Wo, ws.Q8Tmp, attentionProj); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := m.matVec(lw.Wo, attnOut, projOut); err != nil {
+			if err := m.matVec(layerWeights.Wo, attentionOut, attentionProj); err != nil {
 				return nil, err
 			}
 		}
+		// Conexão residual
 		for i := 0; i < nEmb; i++ {
-			x[i] += projOut[i]
+			hiddenState[i] += attentionProj[i]
 		}
 
-		rmsNorm(ffnIn, x, m.FFNNormW[layer], m.HP.RmsEps)
+		// 8. Pré-Normalização para Feed-Forward Network (FFN)
+		rmsNorm(ffnIn, hiddenState, m.FFNNormW[layer], m.HP.RmsEps)
 
-		// ffn up and gate em paralelo
+		// 9. Feed-Forward Network (FFN) - Up e Gate projecions em paralelo
 		var errUp, errGate error
-		isFFNQ8 := lw.Wup.Type() == ggmlTypeQ8_0
+		isFFNQ8 := layerWeights.Wup.Type() == ggmlTypeQ8_0
 		if isFFNQ8 {
 			QuantizeQ8_0Into(ffnIn, &ws.Q8Tmp)
 		}
 
-		// Usar Pool.Run() para paralelizar FFN up e gate
 		m.Pool.Run(
 			func() {
 				if isFFNQ8 {
-					errUp = m.matVecQ8_0(lw.Wup, ws.Q8Tmp, ffnUp)
+					errUp = m.matVecQ8_0(layerWeights.Wup, ws.Q8Tmp, ffnUp)
 				} else {
-					errUp = m.matVec(lw.Wup, ffnIn, ffnUp)
+					errUp = m.matVec(layerWeights.Wup, ffnIn, ffnUp)
 				}
 			},
 			func() {
 				if isFFNQ8 {
-					errGate = m.matVecQ8_0(lw.Wgate, ws.Q8Tmp, ffnGate)
+					errGate = m.matVecQ8_0(layerWeights.Wgate, ws.Q8Tmp, ffnGate)
 				} else {
-					errGate = m.matVec(lw.Wgate, ffnIn, ffnGate)
+					errGate = m.matVec(layerWeights.Wgate, ffnIn, ffnGate)
 				}
 			},
 		)
@@ -443,34 +471,40 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 			return nil, errGate
 		}
 
+		// 10. Função de Ativação (SwiGLU)
 		for i := 0; i < m.HP.NFF; i++ {
 			ffnAct[i] = silu(ffnGate[i]) * ffnUp[i]
 		}
-		if lw.Wdown.Type() == ggmlTypeQ8_0 {
+
+		// 11. Projeção FFN Down e conexão residual
+		if layerWeights.Wdown.Type() == ggmlTypeQ8_0 {
 			QuantizeQ8_0Into(ffnAct, &ws.Q8Tmp)
-			if err := m.matVecQ8_0(lw.Wdown, ws.Q8Tmp, ffnDown); err != nil {
+			if err := m.matVecQ8_0(layerWeights.Wdown, ws.Q8Tmp, ffnDown); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := m.matVec(lw.Wdown, ffnAct, ffnDown); err != nil {
+			if err := m.matVec(layerWeights.Wdown, ffnAct, ffnDown); err != nil {
 				return nil, err
 			}
 		}
+		// Conexão residual
 		for i := 0; i < nEmb; i++ {
-			x[i] += ffnDown[i]
+			hiddenState[i] += ffnDown[i]
 		}
 	}
 
-	rmsNorm(xn, x, m.OutNormW, m.HP.RmsEps)
+	// 12. Pós-Normalização e extração dos Top-K logits diretos
+	rmsNorm(normedState, hiddenState, m.OutNormW, m.HP.RmsEps)
 	if m.OutProj.Type() != ggmlTypeQ8_0 {
 		return nil, fmt.Errorf("ForwardTopK requires Q8_0 output projection")
 	}
-	QuantizeQ8_0Into(xn, &ws.Q8Tmp)
+	QuantizeQ8_0Into(normedState, &ws.Q8Tmp)
 	items, err := m.matVecTopKWS(m.OutProj, ws.Q8Tmp, topK, ws)
 	if err != nil {
 		return nil, err
 	}
 
+	// Avança a posição no estado
 	s.Pos++
 	return items, nil
 }
