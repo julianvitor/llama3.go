@@ -136,10 +136,7 @@ func (m *Model) ForwardIntoWorkspace(s *State, token int32, logitsOut []float32,
 
 				for t := 0; t <= s.Pos; t++ {
 					kt := s.KV.GetK(layer, t, kvh)
-					var dot float32
-					for i := 0; i < headDim; i++ {
-						dot += qh[i] * kt[i]
-					}
+					dot := m.Dot(qh, kt)
 					sc := dot * scale
 					scores[t] = sc
 					if sc > maxScore {
@@ -369,10 +366,7 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 				maxScore := float32(-1e30)
 				for t := 0; t <= s.Pos; t++ {
 					kt := s.KV.GetK(layer, t, kvh)
-					var dot float32
-					for i := 0; i < headDim; i++ {
-						dot += qh[i] * kt[i]
-					}
+					dot := m.Dot(qh, kt)
 					sc := dot * scale
 					scores[t] = sc
 					if sc > maxScore {

@@ -3,9 +3,14 @@
 Chat no terminal que **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem CGO, sem servidor externo).
 
 ## Rodar
-
+Com otimizações para x86(AVX2) ou ARMv8 (neon)
 ```bash
-go run ./cmd/go-llama-chat
+CGO_ENABLED=0 go run ./cmd/go-llama-chat
+```
+
+Para rodar em go puro.
+```bash
+CGO_ENABLED=0 go run ./cmd/go-llama-chat
 ```
 
 Na primeira execução, ele baixa por padrão:
@@ -14,6 +19,8 @@ Na primeira execução, ele baixa por padrão:
 - URL default: `bartowski/Llama-3.2-1B-Instruct-GGUF` (Hugging Face)
 
 O arquivo fica em cache em `~/.cache/go-llama/` (Linux).
+
+
 
 ## Flags úteis
 
