@@ -22,14 +22,11 @@ import (
 const defaultModelURL = "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf"
 
 func main() {
-	// Fixed for this machine: 12 hardware threads.
-	// Set this before flag defaults that depend on GOMAXPROCS.
-	runtime.GOMAXPROCS(12)
 
 	var (
 		modelURL     = flag.String("model-url", defaultModelURL, "URL do arquivo .gguf")
 		modelPath    = flag.String("model-path", "", "Caminho local do .gguf (default: cache do usuário)")
-		threads      = flag.Int("threads", 12, "Threads de CPU (goroutines para matvec)")
+		threads      = flag.Int("threads", runtime.NumCPU(), "Threads de CPU (goroutines para matvec)")
 		ctxLen       = flag.Int("ctx", 2048, "Context length (máx suportado pelo modelo)")
 		temp         = flag.Float64("temp", 0.8, "Temperatura")
 		topk         = flag.Int("topk", 40, "Top-K")
