@@ -400,7 +400,8 @@ func (m *Model) ForwardTopKIntoWorkspace(s *State, token int32, topK int, ws *Wo
 				// Softmax sobre os scores
 				var sumExp float32
 				for t := 0; t <= s.Pos; t++ {
-					expVal := float32(math.Exp(float64(scores[t] - maxScore)))
+					// SUBSTITUIÇÃO AQUI: math.Exp (float64) -> fastExp (float32)
+					expVal := fastExp(scores[t] - maxScore)
 					scores[t] = expVal
 					sumExp += expVal
 				}
@@ -514,4 +515,12 @@ func (m *Model) embedInto(token int32, dst []float32) error {
 		return fmt.Errorf("token out of range: %d", token)
 	}
 	return readRowVecAnyToF32Into(dst, m.TokenEmb, int(token))
+}
+
+// util.go ou no fim do arquivo principal
+func fastExp(x float32) float32 {
+    const magic uint32 = 12102203
+    const bias uint32 = 1064866816 
+    res := uint32(x*float32(magic)) + bias
+    return math.Float32frombits(res)
 }
