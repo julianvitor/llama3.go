@@ -517,7 +517,6 @@ func (m *Model) embedInto(token int32, dst []float32) error {
 	return readRowVecAnyToF32Into(dst, m.TokenEmb, int(token))
 }
 
-// util.go ou no fim do arquivo principal
 func fastExp(x float32) float32 {
     const magic uint32 = 12102203
     const bias uint32 = 1064866816 

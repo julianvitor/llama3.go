@@ -1,14 +1,14 @@
-# go_llama (runtime 100%(quase) Go)
+# go_llama (runtime em Go + Cgo com fallback 100% em go)
 
-Chat no terminal que **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem servidor externo).
+Chat no terminal **baixa automaticamente** um GGUF do **Llama 3.2 1B Instruct** e roda inferência **in-process** em Go (sem servidor externo).
 
 ## Rodar
 Com otimizações para x86(AVX2) ou ARMv8 (neon)
 ```bash
-CGO_ENABLED=0 go run ./cmd/go-llama-chat
+CGO_ENABLED=1 go run ./cmd/go-llama-chat
 ```
 
-Para rodar em go puro.
+Para rodar em go puro(cpus sem SIMD compativel).
 ```bash
 CGO_ENABLED=0 go run ./cmd/go-llama-chat
 ```
