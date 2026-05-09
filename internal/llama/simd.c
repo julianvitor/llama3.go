@@ -8,8 +8,14 @@
     #include <immintrin.h>
     #define USE_AVX2
 #elif defined(__ARM_NEON) || defined(__aarch64__)
-    #include <arm_neon.h>
-    #define USE_NEON
+    // NEON path temporarily disabled due to suspected correctness bug
+    // in the NEON implementation that can produce incorrect dot products
+    // on some ARM platforms (observed repeating tokens). Fall back to
+    // the scalar implementation until NEON code is validated/fixed.
+    // To re-enable NEON, uncomment the lines below after verifying the
+    // implementation.
+    // #include <arm_neon.h>
+    // #define USE_NEON
 #endif
 
 /* --- Estruturas e Auxiliares --- */
