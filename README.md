@@ -66,10 +66,12 @@ export HF_TOKEN=...  # Hugging Face token
 
 | Operating System | CPU | Compilation Version | Status | Throughput |
 | :--- | :--- | :--- | :---: | :---: |
-| Windows | AMD Zen 2 | CGO_ENABLED=1 | ✅ OK | 10.49 tokens/s |
-| Windows | AMD Zen 2 | CGO_ENABLED=0 | ✅ OK | 3.27 tokens/s |
-| Linux (WSL2) | AMD Zen 2 | CGO_ENABLED=0 | ✅ OK | 2.86 tokens/s |
-| Linux (WSL2) | AMD Zen 2 | CGO_ENABLED=1 | ✅ OK | 8.89 tokens/s |
+|🪟 Windows | AMD Zen 2 | CGO_ENABLED=1 | ✅ OK | 10.49 tokens/s |
+|🪟 Windows | AMD Zen 2 | CGO_ENABLED=0 | ✅ OK | 3.35 tokens/s |
+|🐧 Linux (WSL2) | AMD Zen 2 | CGO_ENABLED=0 | ✅ OK | 3.07 tokens/s |
+|🐧 Linux (WSL2) | AMD Zen 2 | CGO_ENABLED=1 | ✅ OK | 8.80 tokens/s |
+|🤖 Linux (android) | Arm Exynos 1380 | CGO_ENABLED=0 | ✅ OK | 1.73 tokens/s |
+|🤖 Linux (android) | Arm Exynos 1380 | CGO_ENABLED=1 | ✅ OK | 2.46 tokens/s |
 
 🧪 Prompt used: `Quem é você?`
 
