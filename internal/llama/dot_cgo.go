@@ -3,11 +3,8 @@
 package llama
 
 /*
-#cgo CFLAGS: -O3
-#cgo amd64 CFLAGS: -mavx2
-#cgo arm64 CFLAGS: -march=armv8-a
+#cgo CFLAGS: -O3 -Wall
 #include "simd.h"
-#cgo amd64 CFLAGS: -O3 -march=native
 
 float dot_product(const float* a, const float* b, int n);
 */

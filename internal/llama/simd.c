@@ -64,7 +64,45 @@ void matvec_q8_c(const void* w_data, const float* x_scales, const int8_t* x_qs, 
         v128 = _mm_add_ps(v128, _mm_shuffle_ps(v128, v128, 1));
         row_sum = _mm_cvtss_f32(v128);
 
-#else // Fallback Escalar para ARM/Genérico (ou implemente NEON aqui)
+#elif defined(USE_NEON)
+        float32x4_t v_sum = vdupq_n_f32(0.0f);
+        for (int b = 0; b < nb; b++) {
+            float d = decode_f16(row_w[b].d) * x_scales[b];
+            const int8_t* wptr = row_w[b].qs;
+            const int8_t* xptr = x_qs + (b * 32);
+
+            int8x16_t vw = vld1q_s8(wptr);
+            int8x16_t vx = vld1q_s8(xptr);
+
+            int8x8_t vw_lo = vget_low_s8(vw);
+            int8x8_t vw_hi = vget_high_s8(vw);
+            int8x8_t vx_lo = vget_low_s8(vx);
+            int8x8_t vx_hi = vget_high_s8(vx);
+
+            int16x8_t w16_lo = vmovl_s8(vw_lo);
+            int16x8_t x16_lo = vmovl_s8(vx_lo);
+            int16x8_t w16_hi = vmovl_s8(vw_hi);
+            int16x8_t x16_hi = vmovl_s8(vx_hi);
+
+            int32x4_t acc_lo = vmull_s16(vget_low_s16(w16_lo), vget_low_s16(x16_lo));
+            acc_lo = vmlal_s16(acc_lo, vget_high_s16(w16_lo), vget_high_s16(x16_lo));
+            int32x4_t acc_hi = vmull_s16(vget_low_s16(w16_hi), vget_low_s16(x16_hi));
+            acc_hi = vmlal_s16(acc_hi, vget_high_s16(w16_hi), vget_high_s16(x16_hi));
+
+            float32x4_t f_lo = vcvtq_f32_s32(acc_lo);
+            float32x4_t f_hi = vcvtq_f32_s32(acc_hi);
+
+            float32x4_t sumf = vaddq_f32(f_lo, f_hi);
+            v_sum = vmlaq_n_f32(v_sum, sumf, d);
+        }
+        {
+            float32x2_t low = vget_low_f32(v_sum);
+            float32x2_t high = vget_high_f32(v_sum);
+            float32x2_t pair = vadd_f32(low, high);
+            float32x2_t tmp = vpadd_f32(pair, pair);
+            row_sum = vget_lane_f32(tmp, 0);
+        }
+#else // Fallback Escalar para ARM/Genérico
         for (int b = 0; b < nb; b++) {
             float d = decode_f16(row_w[b].d) * x_scales[b];
             for (int i = 0; i < 32; i++) {
@@ -72,7 +110,7 @@ void matvec_q8_c(const void* w_data, const float* x_scales, const int8_t* x_qs, 
             }
         }
 #endif
-        out[r] = row_sum;
+    out[r] = row_sum;
     }
 }
 

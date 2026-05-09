@@ -4,8 +4,6 @@ package llama
 
 /*
 #cgo CFLAGS: -O3 -Wall
-#cgo amd64 CFLAGS: -mavx2
-#cgo arm64 CFLAGS: -march=armv8-a
 #include "simd.h"
 */
 import "C"
