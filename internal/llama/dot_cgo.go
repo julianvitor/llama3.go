@@ -4,6 +4,8 @@ package llama
 
 /*
 #cgo CFLAGS: -O3 -Wall
+#cgo amd64 CFLAGS: -mavx2
+#cgo arm64 CFLAGS: -march=armv8-a
 #include "simd.h"
 
 float dot_product(const float* a, const float* b, int n);
@@ -12,9 +14,9 @@ import "C"
 import "unsafe"
 
 func dot(a, b []float32) float32 {
-    return float32(C.dot_product(
-        (*C.float)(unsafe.Pointer(&a[0])),
-        (*C.float)(unsafe.Pointer(&b[0])),
-        C.int(len(a)),
-    ))
+	return float32(C.dot_product(
+		(*C.float)(unsafe.Pointer(&a[0])),
+		(*C.float)(unsafe.Pointer(&b[0])),
+		C.int(len(a)),
+	))
 }

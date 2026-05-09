@@ -4,12 +4,12 @@ package llama
 
 /*
 #cgo CFLAGS: -O3 -Wall
+#cgo amd64 CFLAGS: -mavx2
+#cgo arm64 CFLAGS: -march=armv8-a
 #include "simd.h"
 */
 import "C"
-import (
-	"unsafe"
-)
+import ("unsafe")
 
 func (m *Model) matVecQ8_0(W Tensor, xQ Q8Vector, out []float32) error {
 	cols := int(W.Info.Dims[0])
@@ -17,8 +17,8 @@ func (m *Model) matVecQ8_0(W Tensor, xQ Q8Vector, out []float32) error {
 
 	m.Pool.ParallelFor(rows, func(start, end int) {
 		C.matvec_q8_c(
-			unsafe.Pointer(&W.Data[0]),      // Pesos compactados (34 bytes/bloco)
-			(*C.float)(unsafe.Pointer(&xQ.D[0])), // Escalas da ativação (float32)
+			unsafe.Pointer(&W.Data[0]),            // Pesos compactados (34 bytes/bloco)
+			(*C.float)(unsafe.Pointer(&xQ.D[0])),  // Escalas da ativação (float32)
 			(*C.schar)(unsafe.Pointer(&xQ.Qs[0])), // Pesos da ativação (int8)
 			(*C.float)(unsafe.Pointer(&out[0])),
 			C.int(start),
